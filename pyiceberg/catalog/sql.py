@@ -312,9 +312,9 @@ class SqlCatalog(Catalog):
                     .values(table_namespace=to_database_name, table_name=to_table_name)
                 )
                 result = session.execute(stmt)
+                session.commit()
                 if result.rowcount < 1:
                     raise NoSuchTableError(f"Table does not exist: {from_table_name}")
-                session.commit()
             except IntegrityError as e:
                 raise TableAlreadyExistsError(f"Table {to_database_name}.{to_table_name} already exists") from e
         return self.load_table(to_identifier)
