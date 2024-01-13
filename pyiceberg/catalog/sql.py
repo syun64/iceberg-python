@@ -302,7 +302,7 @@ class SqlCatalog(Catalog):
             raise NoSuchNamespaceError(f"Namespace does not exist: {to_database_name}")
         with Session(self.engine) as session:
             try:
-                if engine.dialect.supports_sane_rowcount:
+                if self.engine.dialect.supports_sane_rowcount:
                     stmt = (
                         update(IcebergTables)
                         .where(
