@@ -269,16 +269,27 @@ class SqlCatalog(Catalog):
         identifier_tuple = self.identifier_to_tuple_without_catalog(identifier)
         database_name, table_name = self.identifier_to_database_and_table(identifier_tuple, NoSuchTableError)
         with Session(self.engine) as session:
-            res = session.execute(
-                delete(IcebergTables).where(
-                    IcebergTables.catalog_name == self.name,
-                    IcebergTables.table_namespace == database_name,
-                    IcebergTables.table_name == table_name,
+            if self.engine.dialect.supports_sane_rowcount:
+                res = session.execute(
+                    delete(IcebergTables).where(
+                        IcebergTables.catalog_name == self.name,
+                        IcebergTables.table_namespace == database_name,
+                        IcebergTables.table_name == table_name,
+                    )
                 )
-            )
+                if res.rowcount < 1:
+                    raise NoSuchTableError(f"Table does not exist: {database_name}.{table_name}")
+            else:
+                tbl = (
+                    session.query(IcebergTables).with_for_update(of=IcebergTables, nowait=True)
+                    .filter(
+                        IcebergTables.catalog_name == self.name,
+                        IcebergTables.table_namespace == database_name,
+                        IcebergTables.table_name == table_name,
+                    ).one()
+                )
+                tbl.delete()
             session.commit()
-        if res.rowcount < 1:
-            raise NoSuchTableError(f"Table does not exist: {database_name}.{table_name}")
 
     def rename_table(self, from_identifier: Union[str, Identifier], to_identifier: Union[str, Identifier]) -> Table:
         """Rename a fully classified table name.
