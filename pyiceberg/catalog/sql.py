@@ -302,19 +302,31 @@ class SqlCatalog(Catalog):
             raise NoSuchNamespaceError(f"Namespace does not exist: {to_database_name}")
         with Session(self.engine) as session:
             try:
-                stmt = (
-                    update(IcebergTables)
-                    .where(
-                        IcebergTables.catalog_name == self.name,
-                        IcebergTables.table_namespace == from_database_name,
-                        IcebergTables.table_name == from_table_name,
+                if engine.dialect.supports_sane_rowcount:
+                    stmt = (
+                        update(IcebergTables)
+                        .where(
+                            IcebergTables.catalog_name == self.name,
+                            IcebergTables.table_namespace == from_database_name,
+                            IcebergTables.table_name == from_table_name,
+                        )
+                        .values(table_namespace=to_database_name, table_name=to_table_name)
                     )
-                    .values(table_namespace=to_database_name, table_name=to_table_name)
-                )
-                result = session.execute(stmt)
+                    result = session.execute(stmt)
+                    if result.rowcount < 1:
+                        raise NoSuchTableError(f"Table does not exist: {from_table_name}")
+                else:
+                    tbl = (
+                        IcebergTables.query.with_for_update(of=IcebergTables, nowait=True)
+                        .filter(
+                            IcebergTables.catalog_name == self.name,
+                            IcebergTables.table_namespace == from_database_name,
+                            IcebergTables.table_name == from_table_name,
+                        ).one()
+                    )
+                    tbl.table_namespace=to_database_name
+                    tbl.table_name=to_table_name
                 session.commit()
-                if result.rowcount < 1:
-                    raise NoSuchTableError(f"Table does not exist: {from_table_name}")
             except IntegrityError as e:
                 raise TableAlreadyExistsError(f"Table {to_database_name}.{to_table_name} already exists") from e
         return self.load_table(to_identifier)
