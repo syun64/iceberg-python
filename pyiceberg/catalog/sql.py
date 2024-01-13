@@ -288,7 +288,7 @@ class SqlCatalog(Catalog):
                         IcebergTables.table_name == table_name,
                     ).one()
                 )
-                tbl.delete()
+                session.delete(tbl)
             session.commit()
 
     def rename_table(self, from_identifier: Union[str, Identifier], to_identifier: Union[str, Identifier]) -> Table:
