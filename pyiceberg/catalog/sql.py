@@ -317,7 +317,7 @@ class SqlCatalog(Catalog):
                         raise NoSuchTableError(f"Table does not exist: {from_table_name}")
                 else:
                     tbl = (
-                        IcebergTables.query.with_for_update(of=IcebergTables, nowait=True)
+                        session.query(IcebergTables).with_for_update(of=IcebergTables, nowait=True)
                         .filter(
                             IcebergTables.catalog_name == self.name,
                             IcebergTables.table_namespace == from_database_name,
