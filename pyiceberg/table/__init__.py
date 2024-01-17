@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime
 import itertools
 import uuid
+import warnings
 from abc import ABC, abstractmethod
 from copy import copy
 from dataclasses import dataclass
@@ -80,6 +81,7 @@ from pyiceberg.table.metadata import (
     TableMetadata,
     TableMetadataUtil,
 )
+from pyiceberg.table.name_mapping import SCHEMA_NAME_MAPPING_DEFAULT, NameMapping, parse_mapping_from_json
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
 from pyiceberg.table.snapshots import (
     Operation,
@@ -865,8 +867,8 @@ class Table:
 
     def current_snapshot(self) -> Optional[Snapshot]:
         """Get the current snapshot for this table, or None if there is no current snapshot."""
-        if snapshot_id := self.metadata.current_snapshot_id:
-            return self.snapshot_by_id(snapshot_id)
+        if self.metadata.current_snapshot_id is not None:
+            return self.snapshot_by_id(self.metadata.current_snapshot_id)
         return None
 
     def snapshot_by_id(self, snapshot_id: int) -> Optional[Snapshot]:
@@ -925,6 +927,12 @@ class Table:
             merge.append_datafile(data_file)
 
         merge.commit()
+    def name_mapping(self) -> NameMapping:
+        """Return the table's field-id NameMapping."""
+        if name_mapping_json := self.properties.get(SCHEMA_NAME_MAPPING_DEFAULT):
+            return parse_mapping_from_json(name_mapping_json)
+        else:
+            return None
 
     def refs(self) -> Dict[str, SnapshotRef]:
         """Return the snapshot references in the table."""
@@ -1038,27 +1046,32 @@ class TableScan(ABC):
         return self.table.current_snapshot()
 
     def projection(self) -> Schema:
-        snapshot_schema = self.table.schema()
-        if snapshot := self.snapshot():
-            if snapshot.schema_id is not None:
-                snapshot_schema = self.table.schemas()[snapshot.schema_id]
+        current_schema = self.table.schema()
+        if self.snapshot_id is not None:
+            snapshot = self.table.snapshot_by_id(self.snapshot_id)
+            if snapshot is not None:
+                if snapshot.schema_id is not None:
+                    snapshot_schema = self.table.schemas().get(snapshot.schema_id)
+                    if snapshot_schema is not None:
+                        current_schema = snapshot_schema
+                    else:
+                        warnings.warn(f"Metadata does not contain schema with id: {snapshot.schema_id}")
+            else:
+                raise ValueError(f"Snapshot not found: {self.snapshot_id}")
 
         if "*" in self.selected_fields:
-            return snapshot_schema
+            return current_schema
 
-        return snapshot_schema.select(*self.selected_fields, case_sensitive=self.case_sensitive)
-
-    @abstractmethod
-    def plan_files(self) -> Iterable[ScanTask]:
-        ...
+        return current_schema.select(*self.selected_fields, case_sensitive=self.case_sensitive)
 
     @abstractmethod
-    def to_arrow(self) -> pa.Table:
-        ...
+    def plan_files(self) -> Iterable[ScanTask]: ...
 
     @abstractmethod
-    def to_pandas(self, **kwargs: Any) -> pd.DataFrame:
-        ...
+    def to_arrow(self) -> pa.Table: ...
+
+    @abstractmethod
+    def to_pandas(self, **kwargs: Any) -> pd.DataFrame: ...
 
     def update(self: S, **overrides: Any) -> S:
         """Create a copy of this table scan with updated fields."""

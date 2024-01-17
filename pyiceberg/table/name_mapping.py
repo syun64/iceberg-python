@@ -20,6 +20,7 @@ Contains everything around the name mapping.
 More information can be found on here:
 https://iceberg.apache.org/spec/#name-mapping-serialization
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -32,6 +33,8 @@ from pydantic import Field, conlist, field_validator, model_serializer
 from pyiceberg.schema import Schema, SchemaVisitor, visit
 from pyiceberg.typedef import IcebergBaseModel, IcebergRootModel
 from pyiceberg.types import ListType, MapType, NestedField, PrimitiveType, StructType
+
+SCHEMA_NAME_MAPPING_DEFAULT = "schema.name-mapping.default"
 
 
 class MappedField(IcebergBaseModel):
