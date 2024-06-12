@@ -334,7 +334,7 @@ table.append(df)
 You can delete some of the data from the table by calling `tbl.delete()` with a desired `delete_filter`.
 
 ```python
-tbl.delete(delete_filter="city == Paris")
+tbl.delete(delete_filter="city == 'Paris'")
 ```
 
 In the above example, any records where the city field value equals to `Paris` will be deleted.
