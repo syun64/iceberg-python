@@ -27,6 +27,25 @@ def build_cython_extensions() -> None:
     from Cython.Build import build_ext, cythonize
     from setuptools import Extension
     from setuptools.dist import Distribution
+    import numpy as np
+    import pyarrow as pa
+
+    package_path = "pyiceberg"
+
+    extra_compile_args = ["-std=c++17"] if os.name == "posix" else []
+    hashing_extension = Extension(
+        # Your .pyx file will be available to cpython at this location.
+        name="pyiceberg.utils.hashing",
+        sources=[
+            os.path.join(package_path, "utils", "hashing.pyx"),
+        ],
+        extra_compile_args=extra_compile_args,
+        language="c++",
+        include_dirs=[np.get_include(), pa.get_include()],
+        libraries=pa.get_libraries(),
+        library_dirs=pa.get_library_dirs(),
+    )
+    arrow_hashing_ext_modules = cythonize([hashing_extension], include_path=list(package_path), language_level=3, annotate=True)
 
     Cython.Compiler.Options.annotate = True
 
@@ -39,8 +58,6 @@ def build_cython_extensions() -> None:
             "-O3",
         ]
 
-    package_path = "pyiceberg"
-
     extension = Extension(
         # Your .pyx file will be available to cpython at this location.
         name="pyiceberg.avro.decoder_fast",
@@ -52,7 +69,7 @@ def build_cython_extensions() -> None:
     )
 
     ext_modules = cythonize([extension], include_path=list(package_path), language_level=3, annotate=True)
-    dist = Distribution({"ext_modules": ext_modules})
+    dist = Distribution({"ext_modules": ext_modules + arrow_hashing_ext_modules})
     cmd = build_ext(dist)
     cmd.ensure_finalized()
 
