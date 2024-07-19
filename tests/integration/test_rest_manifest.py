@@ -125,3 +125,44 @@ def test_write_sample_manifest(table_test_all_types: Table) -> None:
             fa_entry = next(it)
 
             assert fa_entry == wrapped_entry_v2_dict
+
+
+from pyspark.sql import SparkSession
+
+@pytest.mark.integration
+def test_write_round_trip(catalog: Catalog, spark: SparkSession) -> None:
+    from pyiceberg.exceptions import NoSuchTableError
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import NestedField, UUIDType, FixedType
+    schema = Schema(
+        NestedField(field_id=1, name="uuid_col", field_type=UUIDType(), required=False),
+        NestedField(field_id=2, name="fixed_col", field_type=FixedType(25), required=False),
+    )
+
+    identifier = "default.test_table_write_round_trip"
+    try:
+        catalog.drop_table(identifier)
+    except NoSuchTableError:
+        pass
+
+    catalog.create_table(
+        identifier=identifier, schema=schema
+    )
+
+    # write to table with spark sql
+    spark.sql(
+        f"""
+        INSERT INTO integration.{identifier} VALUES
+        ('102cb62f-e6f8-4eb0-9973-d9b012ff0967', CAST('1234567890123456789012345' AS BINARY)),
+        ('ec33e4b2-a834-4cc3-8c4a-a1d3bfc2f226', CAST('1231231231231231231231231' AS BINARY)),
+        ('639cccce-c9d2-494a-a78c-278ab234f024', CAST('12345678901234567ass12345' AS BINARY)),
+        ('c1b0d8e0-0b0e-4b1e-9b0a-0e0b0d0c0a0b', CAST('asdasasdads12312312312111' AS BINARY)),
+        ('923dae77-83d6-47cd-b4b0-d383e64ee57e', CAST('qweeqwwqq1231231231231111' AS BINARY));
+        """
+    )
+
+    tbl = catalog.load_table(identifier)
+    assert tbl.schema() == schema
+    df = tbl.scan().to_arrow().to_pandas()
+    assert len(df) == 5
+    assert b"1234567890123456789012345" in df["fixed_col"].to_list()
