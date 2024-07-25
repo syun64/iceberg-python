@@ -347,7 +347,6 @@ class RestCatalog(Catalog):
         self.uri = config[URI]
 
     def _identifier_to_validated_tuple(self, identifier: Union[str, Identifier]) -> Identifier:
-        print(f"DEBUG: {identifier}")
         identifier_tuple = self.identifier_to_tuple(identifier)
         if len(identifier_tuple) <= 1:
             raise NoSuchTableError(f"Missing namespace or invalid identifier: {'.'.join(identifier_tuple)}")
@@ -632,7 +631,6 @@ class RestCatalog(Catalog):
 
     @retry(**_RETRY_ARGS)
     def load_table(self, identifier: Union[str, Identifier]) -> Table:
-        print(f"LOAD_TABLE: {identifier=}")
         response = self._session.get(self.url(Endpoints.load_table, prefixed=True, **self._split_identifier_for_path(identifier)))
         try:
             response.raise_for_status()
