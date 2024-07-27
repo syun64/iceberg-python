@@ -36,8 +36,14 @@ from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.transforms import IdentityTransform
+from pyiceberg.typedef import Properties
 from pyiceberg.types import IntegerType
-from tests.conftest import BUCKET_NAME, TABLE_METADATA_LOCATION_REGEX
+from tests.conftest import (
+    BUCKET_NAME,
+    DEPRECATED_AWS_SESSION_PROPERTIES,
+    TABLE_METADATA_LOCATION_REGEX,
+    UNIFIED_AWS_SESSION_PROPERTIES,
+)
 
 
 @mock_aws
@@ -639,6 +645,54 @@ def test_passing_profile_name() -> None:
 
 
 @mock_aws
+def test_passing_glue_session_properties() -> None:
+    session_properties: Properties = {
+        "glue.access-key-id": "glue.access-key-id",
+        "glue.secret-access-key": "glue.secret-access-key",
+        "glue.profile-name": "glue.profile-name",
+        "glue.region": "glue.region",
+        "glue.session-token": "glue.session-token",
+        **UNIFIED_AWS_SESSION_PROPERTIES,
+        **DEPRECATED_AWS_SESSION_PROPERTIES,
+    }
+
+    with mock.patch("boto3.Session") as mock_session:
+        test_catalog = GlueCatalog("glue", **session_properties)
+
+    mock_session.assert_called_with(
+        aws_access_key_id="glue.access-key-id",
+        aws_secret_access_key="glue.secret-access-key",
+        aws_session_token="glue.session-token",
+        region_name="glue.region",
+        profile_name="glue.profile-name",
+        botocore_session=None,
+    )
+    assert test_catalog.glue is mock_session().client()
+
+
+@mock_aws
+def test_passing_unified_session_properties_to_glue() -> None:
+    session_properties: Properties = {
+        "glue.profile-name": "glue.profile-name",
+        **UNIFIED_AWS_SESSION_PROPERTIES,
+        **DEPRECATED_AWS_SESSION_PROPERTIES,
+    }
+
+    with mock.patch("boto3.Session") as mock_session:
+        test_catalog = GlueCatalog("glue", **session_properties)
+
+    mock_session.assert_called_with(
+        aws_access_key_id="client.access-key-id",
+        aws_secret_access_key="client.secret-access-key",
+        aws_session_token="client.session-token",
+        region_name="client.region",
+        profile_name="glue.profile-name",
+        botocore_session=None,
+    )
+    assert test_catalog.glue is mock_session().client()
+
+
+@mock_aws
 def test_commit_table_update_schema(
     _glue: boto3.client,
     _bucket_initialize: None,
@@ -811,6 +865,7 @@ def test_create_table_transaction(
         partition_spec=PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="foo")),
         properties={"format-version": format_version},
     ) as txn:
+        last_updated_metadata = txn.table_metadata.last_updated_ms
         with txn.update_schema() as update_schema:
             update_schema.add_column(path="b", field_type=IntegerType())
 
@@ -833,6 +888,7 @@ def test_create_table_transaction(
     assert table.spec().fields_by_source_id(2)[0].name == "bar"
     assert table.spec().fields_by_source_id(2)[0].field_id == 1001
     assert table.spec().fields_by_source_id(2)[0].transform == IdentityTransform()
+    assert table.metadata.last_updated_ms > last_updated_metadata
 
 
 @mock_aws
@@ -862,3 +918,13 @@ def test_register_table_with_given_location(
     table = test_catalog.register_table(identifier, location)
     assert table.identifier == (catalog_name,) + identifier
     assert test_catalog.table_exists(identifier) is True
+
+
+@mock_aws
+def test_glue_endpoint_override(_bucket_initialize: None, moto_endpoint_url: str, database_name: str) -> None:
+    catalog_name = "glue"
+    test_endpoint = "https://test-endpoint"
+    test_catalog = GlueCatalog(
+        catalog_name, **{"s3.endpoint": moto_endpoint_url, "warehouse": f"s3://{BUCKET_NAME}", "glue.endpoint": test_endpoint}
+    )
+    assert test_catalog.glue.meta.endpoint_url == test_endpoint

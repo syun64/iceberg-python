@@ -2029,6 +2029,21 @@ TABLE_METADATA_LOCATION_REGEX = re.compile(
     re.X,
 )
 
+DEPRECATED_AWS_SESSION_PROPERTIES = {
+    "aws_access_key_id": "aws_access_key_id",
+    "aws_secret_access_key": "aws_secret_access_key",
+    "aws_session_token": "aws_session_token",
+    "region_name": "region_name",
+    "profile_name": "profile_name",
+}
+
+UNIFIED_AWS_SESSION_PROPERTIES = {
+    "client.access-key-id": "client.access-key-id",
+    "client.secret-access-key": "client.secret-access-key",
+    "client.region": "client.region",
+    "client.session-token": "client.session-token",
+}
+
 
 @pytest.fixture(name="_bucket_initialize")
 def fixture_s3_bucket(_s3) -> None:  # type: ignore
@@ -2041,6 +2056,11 @@ def get_bucket_name() -> str:
     if bucket_name is None:
         raise ValueError("Please specify a bucket to run the test by setting environment variable AWS_TEST_BUCKET")
     return bucket_name
+
+
+def get_glue_endpoint() -> Optional[str]:
+    """Set the optional environment variable AWS_TEST_GLUE_ENDPOINT for a glue endpoint to test."""
+    return os.getenv("AWS_TEST_GLUE_ENDPOINT")
 
 
 def get_s3_path(bucket_name: str, database_name: Optional[str] = None, table_name: Optional[str] = None) -> str:
@@ -2382,10 +2402,181 @@ def arrow_table_date_timestamps() -> "pa.Table":
 
 
 @pytest.fixture(scope="session")
-def arrow_table_date_timestamps_schema() -> Schema:
-    """Pyarrow table Schema with only date, timestamp and timestamptz values."""
+def table_date_timestamps_schema() -> Schema:
+    """Iceberg table Schema with only date, timestamp and timestamptz values."""
     return Schema(
         NestedField(field_id=1, name="date", field_type=DateType(), required=False),
         NestedField(field_id=2, name="timestamp", field_type=TimestampType(), required=False),
         NestedField(field_id=3, name="timestamptz", field_type=TimestamptzType(), required=False),
+    )
+
+
+@pytest.fixture(scope="session")
+def arrow_table_schema_with_all_timestamp_precisions() -> "pa.Schema":
+    """Pyarrow Schema with all supported timestamp types."""
+    import pyarrow as pa
+
+    return pa.schema([
+        ("timestamp_s", pa.timestamp(unit="s")),
+        ("timestamptz_s", pa.timestamp(unit="s", tz="UTC")),
+        ("timestamp_ms", pa.timestamp(unit="ms")),
+        ("timestamptz_ms", pa.timestamp(unit="ms", tz="UTC")),
+        ("timestamp_us", pa.timestamp(unit="us")),
+        ("timestamptz_us", pa.timestamp(unit="us", tz="UTC")),
+        ("timestamp_ns", pa.timestamp(unit="ns")),
+        ("timestamptz_ns", pa.timestamp(unit="ns", tz="UTC")),
+        ("timestamptz_us_etc_utc", pa.timestamp(unit="us", tz="Etc/UTC")),
+        ("timestamptz_ns_z", pa.timestamp(unit="ns", tz="Z")),
+        ("timestamptz_s_0000", pa.timestamp(unit="s", tz="+00:00")),
+    ])
+
+
+@pytest.fixture(scope="session")
+def arrow_table_with_all_timestamp_precisions(arrow_table_schema_with_all_timestamp_precisions: "pa.Schema") -> "pa.Table":
+    """Pyarrow table with all supported timestamp types."""
+    import pandas as pd
+    import pyarrow as pa
+
+    test_data = pd.DataFrame({
+        "timestamp_s": [datetime(2023, 1, 1, 19, 25, 00), None, datetime(2023, 3, 1, 19, 25, 00)],
+        "timestamptz_s": [
+            datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
+            None,
+            datetime(2023, 3, 1, 19, 25, 00, tzinfo=timezone.utc),
+        ],
+        "timestamp_ms": [datetime(2023, 1, 1, 19, 25, 00), None, datetime(2023, 3, 1, 19, 25, 00)],
+        "timestamptz_ms": [
+            datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
+            None,
+            datetime(2023, 3, 1, 19, 25, 00, tzinfo=timezone.utc),
+        ],
+        "timestamp_us": [datetime(2023, 1, 1, 19, 25, 00), None, datetime(2023, 3, 1, 19, 25, 00)],
+        "timestamptz_us": [
+            datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
+            None,
+            datetime(2023, 3, 1, 19, 25, 00, tzinfo=timezone.utc),
+        ],
+        "timestamp_ns": [
+            pd.Timestamp(year=2024, month=7, day=11, hour=3, minute=30, second=0, microsecond=12, nanosecond=6),
+            None,
+            pd.Timestamp(year=2024, month=7, day=11, hour=3, minute=30, second=0, microsecond=12, nanosecond=7),
+        ],
+        "timestamptz_ns": [
+            datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
+            None,
+            datetime(2023, 3, 1, 19, 25, 00, tzinfo=timezone.utc),
+        ],
+        "timestamptz_us_etc_utc": [
+            datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
+            None,
+            datetime(2023, 3, 1, 19, 25, 00, tzinfo=timezone.utc),
+        ],
+        "timestamptz_ns_z": [
+            pd.Timestamp(year=2024, month=7, day=11, hour=3, minute=30, second=0, microsecond=12, nanosecond=6, tz="UTC"),
+            None,
+            pd.Timestamp(year=2024, month=7, day=11, hour=3, minute=30, second=0, microsecond=12, nanosecond=7, tz="UTC"),
+        ],
+        "timestamptz_s_0000": [
+            datetime(2023, 1, 1, 19, 25, 1, tzinfo=timezone.utc),
+            None,
+            datetime(2023, 3, 1, 19, 25, 1, tzinfo=timezone.utc),
+        ],
+    })
+    return pa.Table.from_pandas(test_data, schema=arrow_table_schema_with_all_timestamp_precisions)
+
+
+@pytest.fixture(scope="session")
+def arrow_table_schema_with_all_microseconds_timestamp_precisions() -> "pa.Schema":
+    """Pyarrow Schema with all microseconds timestamp."""
+    import pyarrow as pa
+
+    return pa.schema([
+        ("timestamp_s", pa.timestamp(unit="us")),
+        ("timestamptz_s", pa.timestamp(unit="us", tz="UTC")),
+        ("timestamp_ms", pa.timestamp(unit="us")),
+        ("timestamptz_ms", pa.timestamp(unit="us", tz="UTC")),
+        ("timestamp_us", pa.timestamp(unit="us")),
+        ("timestamptz_us", pa.timestamp(unit="us", tz="UTC")),
+        ("timestamp_ns", pa.timestamp(unit="us")),
+        ("timestamptz_ns", pa.timestamp(unit="us", tz="UTC")),
+        ("timestamptz_us_etc_utc", pa.timestamp(unit="us", tz="UTC")),
+        ("timestamptz_ns_z", pa.timestamp(unit="us", tz="UTC")),
+        ("timestamptz_s_0000", pa.timestamp(unit="us", tz="UTC")),
+    ])
+
+
+@pytest.fixture(scope="session")
+def table_schema_with_all_microseconds_timestamp_precision() -> Schema:
+    """Iceberg table Schema with only date, timestamp and timestamptz values."""
+    return Schema(
+        NestedField(field_id=1, name="timestamp_s", field_type=TimestampType(), required=False),
+        NestedField(field_id=2, name="timestamptz_s", field_type=TimestamptzType(), required=False),
+        NestedField(field_id=3, name="timestamp_ms", field_type=TimestampType(), required=False),
+        NestedField(field_id=4, name="timestamptz_ms", field_type=TimestamptzType(), required=False),
+        NestedField(field_id=5, name="timestamp_us", field_type=TimestampType(), required=False),
+        NestedField(field_id=6, name="timestamptz_us", field_type=TimestamptzType(), required=False),
+        NestedField(field_id=7, name="timestamp_ns", field_type=TimestampType(), required=False),
+        NestedField(field_id=8, name="timestamptz_ns", field_type=TimestamptzType(), required=False),
+        NestedField(field_id=9, name="timestamptz_us_etc_utc", field_type=TimestamptzType(), required=False),
+        NestedField(field_id=10, name="timestamptz_ns_z", field_type=TimestamptzType(), required=False),
+        NestedField(field_id=11, name="timestamptz_s_0000", field_type=TimestamptzType(), required=False),
+    )
+
+
+@pytest.fixture(scope="session")
+def table_schema_with_promoted_types() -> Schema:
+    """Iceberg table Schema with longs, doubles and uuid in simple and nested types."""
+    return Schema(
+        NestedField(field_id=1, name="long", field_type=LongType(), required=False),
+        NestedField(
+            field_id=2,
+            name="list",
+            field_type=ListType(element_id=4, element_type=LongType(), element_required=False),
+            required=True,
+        ),
+        NestedField(
+            field_id=3,
+            name="map",
+            field_type=MapType(
+                key_id=5,
+                key_type=StringType(),
+                value_id=6,
+                value_type=LongType(),
+                value_required=False,
+            ),
+            required=True,
+        ),
+        NestedField(field_id=7, name="double", field_type=DoubleType(), required=False),
+        NestedField(field_id=8, name="uuid", field_type=UUIDType(), required=False),
+    )
+
+
+@pytest.fixture(scope="session")
+def pyarrow_schema_with_promoted_types() -> "pa.Schema":
+    """Pyarrow Schema with longs, doubles and uuid in simple and nested types."""
+    import pyarrow as pa
+
+    return pa.schema((
+        pa.field("long", pa.int32(), nullable=True),  # can support upcasting integer to long
+        pa.field("list", pa.list_(pa.int32()), nullable=False),  # can support upcasting integer to long
+        pa.field("map", pa.map_(pa.string(), pa.int32()), nullable=False),  # can support upcasting integer to long
+        pa.field("double", pa.float32(), nullable=True),  # can support upcasting float to double
+        pa.field("uuid", pa.binary(length=16), nullable=True),  # can support upcasting float to double
+    ))
+
+
+@pytest.fixture(scope="session")
+def pyarrow_table_with_promoted_types(pyarrow_schema_with_promoted_types: "pa.Schema") -> "pa.Table":
+    """Pyarrow table with longs, doubles and uuid in simple and nested types."""
+    import pyarrow as pa
+
+    return pa.Table.from_pydict(
+        {
+            "long": [1, 9],
+            "list": [[1, 1], [2, 2]],
+            "map": [{"a": 1}, {"b": 2}],
+            "double": [1.1, 9.2],
+            "uuid": [b"qZx\xefNS@\x89\x9b\xf9:\xd0\xee\x9b\xf5E", b"\x97]\x87T^JDJ\x96\x97\xf4v\xe4\x03\x0c\xde"],
+        },
+        schema=pyarrow_schema_with_promoted_types,
     )

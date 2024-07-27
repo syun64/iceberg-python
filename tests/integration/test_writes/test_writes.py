@@ -18,11 +18,12 @@
 import math
 import os
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import urlparse
 
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -32,7 +33,7 @@ from pydantic_core import ValidationError
 from pyspark.sql import SparkSession
 from pytest_mock.plugin import MockerFixture
 
-from pyiceberg.catalog import Catalog
+from pyiceberg.catalog import Catalog, load_catalog
 from pyiceberg.catalog.hive import HiveCatalog
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.catalog.sql import SqlCatalog
@@ -42,7 +43,7 @@ from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import TableProperties
 from pyiceberg.transforms import IdentityTransform
-from pyiceberg.types import IntegerType, NestedField
+from pyiceberg.types import IntegerType, LongType, NestedField
 from utils import _create_table
 
 
@@ -194,15 +195,18 @@ def test_summaries(spark: SparkSession, session_catalog: Catalog, arrow_table_wi
 
     summaries = [row.summary for row in rows]
 
+    file_size = int(summaries[0]["added-files-size"])
+    assert file_size > 0
+
     # Append
     assert summaries[0] == {
         "added-data-files": "1",
-        "added-files-size": "5459",
+        "added-files-size": str(file_size),
         "added-records": "3",
         "total-data-files": "1",
         "total-delete-files": "0",
         "total-equality-deletes": "0",
-        "total-files-size": "5459",
+        "total-files-size": str(file_size),
         "total-position-deletes": "0",
         "total-records": "3",
     }
@@ -210,12 +214,12 @@ def test_summaries(spark: SparkSession, session_catalog: Catalog, arrow_table_wi
     # Append
     assert summaries[1] == {
         "added-data-files": "1",
-        "added-files-size": "5459",
+        "added-files-size": str(file_size),
         "added-records": "3",
         "total-data-files": "2",
         "total-delete-files": "0",
         "total-equality-deletes": "0",
-        "total-files-size": "10918",
+        "total-files-size": str(file_size * 2),
         "total-position-deletes": "0",
         "total-records": "6",
     }
@@ -224,7 +228,7 @@ def test_summaries(spark: SparkSession, session_catalog: Catalog, arrow_table_wi
     assert summaries[2] == {
         "deleted-data-files": "2",
         "deleted-records": "6",
-        "removed-files-size": "10918",
+        "removed-files-size": str(file_size * 2),
         "total-data-files": "0",
         "total-delete-files": "0",
         "total-equality-deletes": "0",
@@ -236,12 +240,12 @@ def test_summaries(spark: SparkSession, session_catalog: Catalog, arrow_table_wi
     # Overwrite
     assert summaries[3] == {
         "added-data-files": "1",
-        "added-files-size": "5459",
+        "added-files-size": str(file_size),
         "added-records": "3",
         "total-data-files": "1",
         "total-delete-files": "0",
         "total-equality-deletes": "0",
-        "total-files-size": "5459",
+        "total-files-size": str(file_size),
         "total-position-deletes": "0",
         "total-records": "3",
     }
@@ -576,6 +580,9 @@ def test_summaries_with_only_nulls(
 
     summaries = [row.summary for row in rows]
 
+    file_size = int(summaries[1]["added-files-size"])
+    assert file_size > 0
+
     assert summaries[0] == {
         "total-data-files": "0",
         "total-delete-files": "0",
@@ -587,12 +594,12 @@ def test_summaries_with_only_nulls(
 
     assert summaries[1] == {
         "added-data-files": "1",
-        "added-files-size": "4239",
+        "added-files-size": str(file_size),
         "added-records": "2",
         "total-data-files": "1",
         "total-delete-files": "0",
         "total-equality-deletes": "0",
-        "total-files-size": "4239",
+        "total-files-size": str(file_size),
         "total-position-deletes": "0",
         "total-records": "2",
     }
@@ -600,7 +607,7 @@ def test_summaries_with_only_nulls(
     assert summaries[2] == {
         "deleted-data-files": "1",
         "deleted-records": "2",
-        "removed-files-size": "4239",
+        "removed-files-size": str(file_size),
         "total-data-files": "0",
         "total-delete-files": "0",
         "total-equality-deletes": "0",
@@ -844,22 +851,25 @@ def test_inspect_snapshots(
     for manifest_list in df["manifest_list"]:
         assert manifest_list.as_py().startswith("s3://")
 
+    file_size = int(next(value for key, value in df["summary"][0].as_py() if key == "added-files-size"))
+    assert file_size > 0
+
     # Append
     assert df["summary"][0].as_py() == [
-        ("added-files-size", "5459"),
+        ("added-files-size", str(file_size)),
         ("added-data-files", "1"),
         ("added-records", "3"),
         ("total-data-files", "1"),
         ("total-delete-files", "0"),
         ("total-records", "3"),
-        ("total-files-size", "5459"),
+        ("total-files-size", str(file_size)),
         ("total-position-deletes", "0"),
         ("total-equality-deletes", "0"),
     ]
 
     # Delete
     assert df["summary"][1].as_py() == [
-        ("removed-files-size", "5459"),
+        ("removed-files-size", str(file_size)),
         ("deleted-data-files", "1"),
         ("deleted-records", "3"),
         ("total-data-files", "0"),
@@ -954,9 +964,10 @@ def test_sanitize_character_partitioned(catalog: Catalog) -> None:
     assert len(tbl.scan().to_arrow()) == 22
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("format_version", [1, 2])
-def table_write_subset_of_schema(session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int) -> None:
-    identifier = "default.table_append_subset_of_schema"
+def test_table_write_subset_of_schema(session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int) -> None:
+    identifier = "default.test_table_write_subset_of_schema"
     tbl = _create_table(session_catalog, identifier, {"format-version": format_version}, [arrow_table_with_null])
     arrow_table_without_some_columns = arrow_table_with_null.combine_chunks().drop(arrow_table_with_null.column_names[0])
     assert len(arrow_table_without_some_columns.columns) < len(arrow_table_with_null.columns)
@@ -968,69 +979,138 @@ def table_write_subset_of_schema(session_catalog: Catalog, arrow_table_with_null
 
 @pytest.mark.integration
 @pytest.mark.parametrize("format_version", [1, 2])
-def test_write_all_timestamp_precision(mocker: MockerFixture, session_catalog: Catalog, format_version: int) -> None:
+def test_table_write_out_of_order_schema(session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int) -> None:
+    identifier = "default.test_table_write_out_of_order_schema"
+    # rotate the schema fields by 1
+    fields = list(arrow_table_with_null.schema)
+    rotated_fields = fields[1:] + fields[:1]
+    rotated_schema = pa.schema(rotated_fields)
+    assert arrow_table_with_null.schema != rotated_schema
+    tbl = _create_table(session_catalog, identifier, {"format-version": format_version}, schema=rotated_schema)
+
+    tbl.overwrite(arrow_table_with_null)
+    tbl.append(arrow_table_with_null)
+    # overwrite and then append should produce twice the data
+    assert len(tbl.scan().to_arrow()) == len(arrow_table_with_null) * 2
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_table_write_schema_with_valid_nullability_diff(
+    spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
+) -> None:
+    identifier = "default.test_table_write_with_valid_nullability_diff"
+    table_schema = Schema(
+        NestedField(field_id=1, name="long", field_type=LongType(), required=False),
+    )
+    other_schema = pa.schema((
+        pa.field("long", pa.int64(), nullable=False),  # can support writing required pyarrow field to optional Iceberg field
+    ))
+    arrow_table = pa.Table.from_pydict(
+        {
+            "long": [1, 9],
+        },
+        schema=other_schema,
+    )
+    tbl = _create_table(session_catalog, identifier, {"format-version": format_version}, [arrow_table], schema=table_schema)
+    # table's long field should cast to be optional on read
+    written_arrow_table = tbl.scan().to_arrow()
+    assert written_arrow_table == arrow_table.cast(pa.schema((pa.field("long", pa.int64(), nullable=True),)))
+    lhs = spark.table(f"{identifier}").toPandas()
+    rhs = written_arrow_table.to_pandas()
+
+    for column in written_arrow_table.column_names:
+        for left, right in zip(lhs[column].to_list(), rhs[column].to_list()):
+            assert left == right
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_table_write_schema_with_valid_upcast(
+    spark: SparkSession,
+    session_catalog: Catalog,
+    format_version: int,
+    table_schema_with_promoted_types: Schema,
+    pyarrow_schema_with_promoted_types: pa.Schema,
+    pyarrow_table_with_promoted_types: pa.Table,
+) -> None:
+    identifier = "default.test_table_write_with_valid_upcast"
+
+    tbl = _create_table(
+        session_catalog,
+        identifier,
+        {"format-version": format_version},
+        [pyarrow_table_with_promoted_types],
+        schema=table_schema_with_promoted_types,
+    )
+    # table's long field should cast to long on read
+    written_arrow_table = tbl.scan().to_arrow()
+    assert written_arrow_table == pyarrow_table_with_promoted_types.cast(
+        pa.schema((
+            pa.field("long", pa.int64(), nullable=True),
+            pa.field("list", pa.large_list(pa.int64()), nullable=False),
+            pa.field("map", pa.map_(pa.large_string(), pa.int64()), nullable=False),
+            pa.field("double", pa.float64(), nullable=True),  # can support upcasting float to double
+            pa.field("uuid", pa.binary(length=16), nullable=True),  # can UUID is read as fixed length binary of length 16
+        ))
+    )
+    lhs = spark.table(f"{identifier}").toPandas()
+    rhs = written_arrow_table.to_pandas()
+
+    for column in written_arrow_table.column_names:
+        for left, right in zip(lhs[column].to_list(), rhs[column].to_list()):
+            if column == "map":
+                # Arrow returns a list of tuples, instead of a dict
+                right = dict(right)
+            if column == "list":
+                # Arrow returns an array, convert to list for equality check
+                left, right = list(left), list(right)
+            if column == "uuid":
+                # Spark Iceberg represents UUID as hex string like '715a78ef-4e53-4089-9bf9-3ad0ee9bf545'
+                # whereas PyIceberg represents UUID as bytes on read
+                left, right = left.replace("-", ""), right.hex()
+            assert left == right
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_write_all_timestamp_precision(
+    mocker: MockerFixture,
+    spark: SparkSession,
+    session_catalog: Catalog,
+    format_version: int,
+    arrow_table_schema_with_all_timestamp_precisions: pa.Schema,
+    arrow_table_with_all_timestamp_precisions: pa.Table,
+    arrow_table_schema_with_all_microseconds_timestamp_precisions: pa.Schema,
+) -> None:
     identifier = "default.table_all_timestamp_precision"
-    arrow_table_schema_with_all_timestamp_precisions = pa.schema([
-        ("timestamp_s", pa.timestamp(unit="s")),
-        ("timestamptz_s", pa.timestamp(unit="s", tz="UTC")),
-        ("timestamp_ms", pa.timestamp(unit="ms")),
-        ("timestamptz_ms", pa.timestamp(unit="ms", tz="UTC")),
-        ("timestamp_us", pa.timestamp(unit="us")),
-        ("timestamptz_us", pa.timestamp(unit="us", tz="UTC")),
-        ("timestamp_ns", pa.timestamp(unit="ns")),
-        ("timestamptz_ns", pa.timestamp(unit="ns", tz="UTC")),
-    ])
-    TEST_DATA_WITH_NULL = {
-        "timestamp_s": [datetime(2023, 1, 1, 19, 25, 00), None, datetime(2023, 3, 1, 19, 25, 00)],
-        "timestamptz_s": [
-            datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
-            None,
-            datetime(2023, 3, 1, 19, 25, 00, tzinfo=timezone.utc),
-        ],
-        "timestamp_ms": [datetime(2023, 1, 1, 19, 25, 00), None, datetime(2023, 3, 1, 19, 25, 00)],
-        "timestamptz_ms": [
-            datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
-            None,
-            datetime(2023, 3, 1, 19, 25, 00, tzinfo=timezone.utc),
-        ],
-        "timestamp_us": [datetime(2023, 1, 1, 19, 25, 00), None, datetime(2023, 3, 1, 19, 25, 00)],
-        "timestamptz_us": [
-            datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
-            None,
-            datetime(2023, 3, 1, 19, 25, 00, tzinfo=timezone.utc),
-        ],
-        "timestamp_ns": [datetime(2023, 1, 1, 19, 25, 00), None, datetime(2023, 3, 1, 19, 25, 00)],
-        "timestamptz_ns": [
-            datetime(2023, 1, 1, 19, 25, 00, tzinfo=timezone.utc),
-            None,
-            datetime(2023, 3, 1, 19, 25, 00, tzinfo=timezone.utc),
-        ],
-    }
-    input_arrow_table = pa.Table.from_pydict(TEST_DATA_WITH_NULL, schema=arrow_table_schema_with_all_timestamp_precisions)
     mocker.patch.dict(os.environ, values={"PYICEBERG_DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE": "True"})
 
     tbl = _create_table(
         session_catalog,
         identifier,
         {"format-version": format_version},
-        data=[input_arrow_table],
+        data=[arrow_table_with_all_timestamp_precisions],
         schema=arrow_table_schema_with_all_timestamp_precisions,
     )
-    tbl.overwrite(input_arrow_table)
+    tbl.overwrite(arrow_table_with_all_timestamp_precisions)
     written_arrow_table = tbl.scan().to_arrow()
 
-    expected_schema_in_all_us = pa.schema([
-        ("timestamp_s", pa.timestamp(unit="us")),
-        ("timestamptz_s", pa.timestamp(unit="us", tz="UTC")),
-        ("timestamp_ms", pa.timestamp(unit="us")),
-        ("timestamptz_ms", pa.timestamp(unit="us", tz="UTC")),
-        ("timestamp_us", pa.timestamp(unit="us")),
-        ("timestamptz_us", pa.timestamp(unit="us", tz="UTC")),
-        ("timestamp_ns", pa.timestamp(unit="us")),
-        ("timestamptz_ns", pa.timestamp(unit="us", tz="UTC")),
-    ])
-    assert written_arrow_table.schema == expected_schema_in_all_us
-    assert written_arrow_table == input_arrow_table.cast(expected_schema_in_all_us)
+    assert written_arrow_table.schema == arrow_table_schema_with_all_microseconds_timestamp_precisions
+    assert written_arrow_table == arrow_table_with_all_timestamp_precisions.cast(
+        arrow_table_schema_with_all_microseconds_timestamp_precisions, safe=False
+    )
+    lhs = spark.table(f"{identifier}").toPandas()
+    rhs = written_arrow_table.to_pandas()
+
+    for column in written_arrow_table.column_names:
+        for left, right in zip(lhs[column].to_list(), rhs[column].to_list()):
+            if pd.isnull(left):
+                assert pd.isnull(right)
+            else:
+                # Check only upto microsecond precision since Spark loaded dtype is timezone unaware
+                # and supports upto microsecond precision
+                assert left.timestamp() == right.timestamp(), f"Difference in column {column}: {left} != {right}"
 
 
 @pytest.mark.integration
@@ -1202,3 +1282,14 @@ def test_merge_manifests_file_content(session_catalog: Catalog, arrow_table_with
             (11, 3),
             (12, 3),
         ]
+
+
+@pytest.mark.integration
+def test_rest_catalog_with_empty_catalog_name_append_data(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.test_rest_append"
+    test_catalog = load_catalog(
+        "",  # intentionally empty
+        **session_catalog.properties,
+    )
+    tbl = _create_table(test_catalog, identifier, data=[])
+    tbl.append(arrow_table_with_null)

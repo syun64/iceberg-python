@@ -17,8 +17,9 @@
 # pylint:disable=redefined-outer-name
 
 import os
+import re
 from datetime import date
-from typing import Iterator, Optional
+from typing import Iterator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -28,7 +29,9 @@ from pytest_mock.plugin import MockerFixture
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.exceptions import NoSuchTableError
-from pyiceberg.partitioning import PartitionField, PartitionSpec
+from pyiceberg.io import FileIO
+from pyiceberg.io.pyarrow import _pyarrow_schema_ensure_large_types
+from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table
 from pyiceberg.transforms import BucketTransform, IdentityTransform, MonthTransform
@@ -36,6 +39,7 @@ from pyiceberg.types import (
     BooleanType,
     DateType,
     IntegerType,
+    LongType,
     NestedField,
     StringType,
     TimestamptzType,
@@ -107,22 +111,31 @@ ARROW_TABLE_UPDATED = pa.Table.from_pylist(
 )
 
 
+def _write_parquet(io: FileIO, file_path: str, arrow_schema: pa.Schema, arrow_table: pa.Table) -> None:
+    fo = io.new_output(file_path)
+    with fo.create(overwrite=True) as fos:
+        with pq.ParquetWriter(fos, schema=arrow_schema) as writer:
+            writer.write_table(arrow_table)
+
+
 def _create_table(
-    session_catalog: Catalog, identifier: str, format_version: int, partition_spec: Optional[PartitionSpec] = None
+    session_catalog: Catalog,
+    identifier: str,
+    format_version: int,
+    partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+    schema: Schema = TABLE_SCHEMA,
 ) -> Table:
     try:
         session_catalog.drop_table(identifier=identifier)
     except NoSuchTableError:
         pass
 
-    tbl = session_catalog.create_table(
+    return session_catalog.create_table(
         identifier=identifier,
-        schema=TABLE_SCHEMA,
+        schema=schema,
         properties={"format-version": str(format_version)},
-        partition_spec=partition_spec if partition_spec else PartitionSpec(),
+        partition_spec=partition_spec,
     )
-
-    return tbl
 
 
 @pytest.fixture(name="format_version", params=[pytest.param(1, id="format_version=1"), pytest.param(2, id="format_version=2")])
@@ -454,7 +467,113 @@ def test_add_files_snapshot_properties(spark: SparkSession, session_catalog: Cat
 
 
 @pytest.mark.integration
-def test_timestamp_tz_ns_downcast_on_read(session_catalog: Catalog, format_version: int, mocker: MockerFixture) -> None:
+def test_add_files_fails_on_schema_mismatch(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
+    identifier = f"default.table_schema_mismatch_fails_v{format_version}"
+
+    tbl = _create_table(session_catalog, identifier, format_version)
+    WRONG_SCHEMA = pa.schema([
+        ("foo", pa.bool_()),
+        ("bar", pa.string()),
+        ("baz", pa.string()),  # should be integer
+        ("qux", pa.date32()),
+    ])
+    file_path = f"s3://warehouse/default/table_schema_mismatch_fails/v{format_version}/test.parquet"
+    # write parquet files
+    fo = tbl.io.new_output(file_path)
+    with fo.create(overwrite=True) as fos:
+        with pq.ParquetWriter(fos, schema=WRONG_SCHEMA) as writer:
+            writer.write_table(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            "foo": True,
+                            "bar": "bar_string",
+                            "baz": "123",
+                            "qux": date(2024, 3, 7),
+                        },
+                        {
+                            "foo": True,
+                            "bar": "bar_string",
+                            "baz": "124",
+                            "qux": date(2024, 3, 7),
+                        },
+                    ],
+                    schema=WRONG_SCHEMA,
+                )
+            )
+
+    expected = """Mismatch in fields:
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Table field              ┃ Dataframe field          ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ✅ │ 1: foo: optional boolean │ 1: foo: optional boolean │
+│ ✅ │ 2: bar: optional string  │ 2: bar: optional string  │
+│ ❌ │ 3: baz: optional int     │ 3: baz: optional string  │
+│ ✅ │ 4: qux: optional date    │ 4: qux: optional date    │
+└────┴──────────────────────────┴──────────────────────────┘
+"""
+
+    with pytest.raises(ValueError, match=expected):
+        tbl.add_files(file_paths=[file_path])
+
+
+@pytest.mark.integration
+def test_add_files_with_large_and_regular_schema(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
+    identifier = f"default.unpartitioned_with_large_types{format_version}"
+
+    iceberg_schema = Schema(NestedField(1, "foo", StringType(), required=True))
+    arrow_schema = pa.schema([
+        pa.field("foo", pa.string(), nullable=False),
+    ])
+    arrow_schema_large = pa.schema([
+        pa.field("foo", pa.large_string(), nullable=False),
+    ])
+
+    tbl = _create_table(session_catalog, identifier, format_version, schema=iceberg_schema)
+
+    file_path = f"s3://warehouse/default/unpartitioned_with_large_types/v{format_version}/test-0.parquet"
+    _write_parquet(
+        tbl.io,
+        file_path,
+        arrow_schema,
+        pa.Table.from_pylist(
+            [
+                {
+                    "foo": "normal",
+                }
+            ],
+            schema=arrow_schema,
+        ),
+    )
+
+    tbl.add_files([file_path])
+
+    table_schema = tbl.scan().to_arrow().schema
+    assert table_schema == arrow_schema_large
+
+    file_path_large = f"s3://warehouse/default/unpartitioned_with_large_types/v{format_version}/test-1.parquet"
+    _write_parquet(
+        tbl.io,
+        file_path_large,
+        arrow_schema_large,
+        pa.Table.from_pylist(
+            [
+                {
+                    "foo": "normal",
+                }
+            ],
+            schema=arrow_schema_large,
+        ),
+    )
+
+    tbl.add_files([file_path_large])
+
+    table_schema = tbl.scan().to_arrow().schema
+    assert table_schema == arrow_schema_large
+
+
+@pytest.mark.integration
+def test_add_files_with_timestamp_tz_ns_fails(session_catalog: Catalog, format_version: int, mocker: MockerFixture) -> None:
     nanoseconds_schema_iceberg = Schema(NestedField(1, "quux", TimestamptzType()))
 
     nanoseconds_schema = pa.schema([
@@ -472,38 +591,144 @@ def test_timestamp_tz_ns_downcast_on_read(session_catalog: Catalog, format_versi
     mocker.patch.dict(os.environ, values={"PYICEBERG_DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE": "True"})
 
     identifier = f"default.timestamptz_ns_added{format_version}"
+    tbl = _create_table(session_catalog, identifier, format_version, schema=nanoseconds_schema_iceberg)
 
-    try:
-        session_catalog.drop_table(identifier=identifier)
-    except NoSuchTableError:
-        pass
-
-    tbl = session_catalog.create_table(
-        identifier=identifier,
-        schema=nanoseconds_schema_iceberg,
-        properties={"format-version": str(format_version)},
-        partition_spec=PartitionSpec(),
-    )
-
-    file_paths = [f"s3://warehouse/default/test_timestamp_tz/v{format_version}/test-{i}.parquet" for i in range(5)]
+    file_path = f"s3://warehouse/default/test_timestamp_tz/v{format_version}/test.parquet"
     # write parquet files
-    for file_path in file_paths:
-        fo = tbl.io.new_output(file_path)
-        with fo.create(overwrite=True) as fos:
-            with pq.ParquetWriter(fos, schema=nanoseconds_schema) as writer:
-                writer.write_table(arrow_table)
+    fo = tbl.io.new_output(file_path)
+    with fo.create(overwrite=True) as fos:
+        with pq.ParquetWriter(fos, schema=nanoseconds_schema) as writer:
+            writer.write_table(arrow_table)
 
     # add the parquet files as data files
-    tbl.add_files(file_paths=file_paths)
+    with pytest.raises(
+        TypeError,
+        match=re.escape(
+            "Iceberg does not yet support 'ns' timestamp precision. Use 'downcast-ns-timestamp-to-us-on-write' configuration property to automatically downcast 'ns' to 'us' on write."
+        ),
+    ):
+        tbl.add_files(file_paths=[file_path])
 
-    assert tbl.scan().to_arrow() == pa.concat_tables(
-        [
-            arrow_table.cast(
-                pa.schema([
-                    ("quux", pa.timestamp("us", tz="UTC")),
-                ]),
-                safe=False,
-            )
-        ]
-        * 5
+
+@pytest.mark.integration
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_add_file_with_valid_nullability_diff(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
+    identifier = f"default.test_table_with_valid_nullability_diff{format_version}"
+    table_schema = Schema(
+        NestedField(field_id=1, name="long", field_type=LongType(), required=False),
     )
+    other_schema = pa.schema((
+        pa.field("long", pa.int64(), nullable=False),  # can support writing required pyarrow field to optional Iceberg field
+    ))
+    arrow_table = pa.Table.from_pydict(
+        {
+            "long": [1, 9],
+        },
+        schema=other_schema,
+    )
+    tbl = _create_table(session_catalog, identifier, format_version, schema=table_schema)
+
+    file_path = f"s3://warehouse/default/test_add_file_with_valid_nullability_diff/v{format_version}/test.parquet"
+    # write parquet files
+    fo = tbl.io.new_output(file_path)
+    with fo.create(overwrite=True) as fos:
+        with pq.ParquetWriter(fos, schema=other_schema) as writer:
+            writer.write_table(arrow_table)
+
+    tbl.add_files(file_paths=[file_path])
+    # table's long field should cast to be optional on read
+    written_arrow_table = tbl.scan().to_arrow()
+    assert written_arrow_table == arrow_table.cast(pa.schema((pa.field("long", pa.int64(), nullable=True),)))
+    lhs = spark.table(f"{identifier}").toPandas()
+    rhs = written_arrow_table.to_pandas()
+
+    for column in written_arrow_table.column_names:
+        for left, right in zip(lhs[column].to_list(), rhs[column].to_list()):
+            assert left == right
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_add_files_with_valid_upcast(
+    spark: SparkSession,
+    session_catalog: Catalog,
+    format_version: int,
+    table_schema_with_promoted_types: Schema,
+    pyarrow_schema_with_promoted_types: pa.Schema,
+    pyarrow_table_with_promoted_types: pa.Table,
+) -> None:
+    identifier = f"default.test_table_with_valid_upcast{format_version}"
+    tbl = _create_table(session_catalog, identifier, format_version, schema=table_schema_with_promoted_types)
+
+    file_path = f"s3://warehouse/default/test_add_files_with_valid_upcast/v{format_version}/test.parquet"
+    # write parquet files
+    fo = tbl.io.new_output(file_path)
+    with fo.create(overwrite=True) as fos:
+        with pq.ParquetWriter(fos, schema=pyarrow_schema_with_promoted_types) as writer:
+            writer.write_table(pyarrow_table_with_promoted_types)
+
+    tbl.add_files(file_paths=[file_path])
+    # table's long field should cast to long on read
+    written_arrow_table = tbl.scan().to_arrow()
+    assert written_arrow_table == pyarrow_table_with_promoted_types.cast(
+        pa.schema((
+            pa.field("long", pa.int64(), nullable=True),
+            pa.field("list", pa.large_list(pa.int64()), nullable=False),
+            pa.field("map", pa.map_(pa.large_string(), pa.int64()), nullable=False),
+            pa.field("double", pa.float64(), nullable=True),
+            pa.field("uuid", pa.binary(length=16), nullable=True),  # can UUID is read as fixed length binary of length 16
+        ))
+    )
+    lhs = spark.table(f"{identifier}").toPandas()
+    rhs = written_arrow_table.to_pandas()
+
+    for column in written_arrow_table.column_names:
+        for left, right in zip(lhs[column].to_list(), rhs[column].to_list()):
+            if column == "map":
+                # Arrow returns a list of tuples, instead of a dict
+                right = dict(right)
+            if column == "list":
+                # Arrow returns an array, convert to list for equality check
+                left, right = list(left), list(right)
+            if column == "uuid":
+                # Spark Iceberg represents UUID as hex string like '715a78ef-4e53-4089-9bf9-3ad0ee9bf545'
+                # whereas PyIceberg represents UUID as bytes on read
+                left, right = left.replace("-", ""), right.hex()
+            assert left == right
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_add_files_subset_of_schema(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
+    identifier = f"default.test_table_subset_of_schema{format_version}"
+    tbl = _create_table(session_catalog, identifier, format_version)
+
+    file_path = f"s3://warehouse/default/test_add_files_subset_of_schema/v{format_version}/test.parquet"
+    arrow_table_without_some_columns = ARROW_TABLE.combine_chunks().drop(ARROW_TABLE.column_names[0])
+
+    # write parquet files
+    fo = tbl.io.new_output(file_path)
+    with fo.create(overwrite=True) as fos:
+        with pq.ParquetWriter(fos, schema=arrow_table_without_some_columns.schema) as writer:
+            writer.write_table(arrow_table_without_some_columns)
+
+    tbl.add_files(file_paths=[file_path])
+    written_arrow_table = tbl.scan().to_arrow()
+    assert tbl.scan().to_arrow() == pa.Table.from_pylist(
+        [
+            {
+                "foo": None,  # Missing column is read as None on read
+                "bar": "bar_string",
+                "baz": 123,
+                "qux": date(2024, 3, 7),
+            }
+        ],
+        schema=_pyarrow_schema_ensure_large_types(ARROW_SCHEMA),
+    )
+
+    lhs = spark.table(f"{identifier}").toPandas()
+    rhs = written_arrow_table.to_pandas()
+
+    for column in written_arrow_table.column_names:
+        for left, right in zip(lhs[column].to_list(), rhs[column].to_list()):
+            assert left == right

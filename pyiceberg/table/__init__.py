@@ -58,7 +58,6 @@ from pyiceberg.expressions import (
     And,
     BooleanExpression,
     EqualTo,
-    Not,
     Or,
     Reference,
 )
@@ -73,7 +72,6 @@ from pyiceberg.expressions.visitors import (
     manifest_evaluator,
 )
 from pyiceberg.io import FileIO, OutputFile, load_file_io
-from pyiceberg.io.pyarrow import _dataframe_to_data_files, expression_to_pyarrow, project_table
 from pyiceberg.manifest import (
     POSITIONAL_DELETE_SCHEMA,
     DataFile,
@@ -92,7 +90,6 @@ from pyiceberg.partitioning import (
     PARTITION_FIELD_ID_START,
     UNPARTITIONED_PARTITION_SPEC,
     PartitionField,
-    PartitionFieldValue,
     PartitionKey,
     PartitionSpec,
     _PartitionNameGenerator,
@@ -167,54 +164,8 @@ if TYPE_CHECKING:
 
 ALWAYS_TRUE = AlwaysTrue()
 TABLE_ROOT_ID = -1
-DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
 _JAVA_LONG_MAX = 9223372036854775807
-
-
-def _check_schema_compatible(table_schema: Schema, other_schema: "pa.Schema") -> None:
-    """
-    Check if the `table_schema` is compatible with `other_schema`.
-
-    Two schemas are considered compatible when they are equal in terms of the Iceberg Schema type.
-
-    Raises:
-        ValueError: If the schemas are not compatible.
-    """
-    from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids, pyarrow_to_schema
-
-    downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
-    name_mapping = table_schema.name_mapping
-    try:
-        task_schema = pyarrow_to_schema(
-            other_schema, name_mapping=name_mapping, downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us
-        )
-    except ValueError as e:
-        other_schema = _pyarrow_to_schema_without_ids(other_schema, downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us)
-        additional_names = set(other_schema.column_names) - set(table_schema.column_names)
-        raise ValueError(
-            f"PyArrow table contains more columns: {', '.join(sorted(additional_names))}. Update the schema first (hint, use union_by_name)."
-        ) from e
-
-    if table_schema.as_struct() != task_schema.as_struct():
-        from rich.console import Console
-        from rich.table import Table as RichTable
-
-        console = Console(record=True)
-
-        rich_table = RichTable(show_header=True, header_style="bold")
-        rich_table.add_column("")
-        rich_table.add_column("Table field")
-        rich_table.add_column("Dataframe field")
-
-        for lhs in table_schema.fields:
-            try:
-                rhs = task_schema.find_field(lhs.field_id)
-                rich_table.add_row("✅" if lhs == rhs else "❌", str(lhs), str(rhs))
-            except ValueError:
-                rich_table.add_row("❌", str(lhs), "Missing")
-
-        console.print(rich_table)
-        raise ValueError(f"Mismatch in fields:\n{console.export_text()}")
+DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
 
 
 class TableProperties:
@@ -300,6 +251,13 @@ class PropertyUtil:
         if value := properties.get(property_name):
             return value.lower() == "true"
         return default
+
+    @staticmethod
+    def get_first_property_value(properties: Properties, *property_names: str) -> Optional[Any]:
+        for property_name in property_names:
+            if property_value := properties.get(property_name):
+                return property_value
+        return None
 
 
 class Transaction:
@@ -518,6 +476,8 @@ class Transaction:
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
 
+        from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, _dataframe_to_data_files
+
         if not isinstance(df, pa.Table):
             raise ValueError(f"Expected PyArrow table, got: {df}")
 
@@ -527,12 +487,10 @@ class Transaction:
             raise ValueError(
                 f"Not all partition types are supported for writes. Following partitions cannot be written using pyarrow: {unsupported_partitions}."
             )
-
-        _check_schema_compatible(self._table.schema(), other_schema=df.schema)
-        # cast if the two schemas are compatible but not equal
-        table_arrow_schema = self._table.schema().as_arrow()
-        if table_arrow_schema != df.schema:
-            df = df.cast(table_arrow_schema)
+        downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
+        _check_pyarrow_schema_compatible(
+            self._table.schema(), provided_schema=df.schema, downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us
+        )
 
         manifest_merge_enabled = PropertyUtil.property_as_bool(
             self.table_metadata.properties,
@@ -577,6 +535,8 @@ class Transaction:
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
 
+        from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, _dataframe_to_data_files
+
         if not isinstance(df, pa.Table):
             raise ValueError(f"Expected PyArrow table, got: {df}")
 
@@ -586,12 +546,10 @@ class Transaction:
             raise ValueError(
                 f"Not all partition types are supported for writes. Following partitions cannot be written using pyarrow: {unsupported_partitions}."
             )
-
-        _check_schema_compatible(self._table.schema(), other_schema=df.schema)
-        # cast if the two schemas are compatible but not equal
-        table_arrow_schema = self._table.schema().as_arrow()
-        if table_arrow_schema != df.schema:
-            df = df.cast(table_arrow_schema)
+        downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
+        _check_pyarrow_schema_compatible(
+            self._table.schema(), provided_schema=df.schema, downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us
+        )
 
         self.delete(delete_filter=overwrite_filter, snapshot_properties=snapshot_properties)
 
@@ -617,6 +575,12 @@ class Transaction:
             delete_filter: A boolean expression to delete rows from a table
             snapshot_properties: Custom properties to be added to the snapshot summary
         """
+        from pyiceberg.io.pyarrow import (
+            _dataframe_to_data_files,
+            _expression_to_complementary_pyarrow,
+            project_table,
+        )
+
         if (
             self.table_metadata.properties.get(TableProperties.DELETE_MODE, TableProperties.DELETE_MODE_DEFAULT)
             == TableProperties.DELETE_MODE_MERGE_ON_READ
@@ -632,7 +596,7 @@ class Transaction:
         # Check if there are any files that require an actual rewrite of a data file
         if delete_snapshot.rewrites_needed is True:
             bound_delete_filter = bind(self._table.schema(), delete_filter, case_sensitive=True)
-            preserve_row_filter = expression_to_pyarrow(Not(bound_delete_filter))
+            preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter)
 
             files = self._scan(row_filter=delete_filter).plan_files()
 
@@ -947,6 +911,9 @@ class _TableMetadataUpdateContext:
             update.sort_order.order_id == sort_order_id for update in self._updates if isinstance(update, AddSortOrderUpdate)
         )
 
+    def has_changes(self) -> bool:
+        return len(self._updates) > 0
+
 
 @singledispatch
 def _apply_table_update(update: TableUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
@@ -1220,6 +1187,10 @@ def update_table_metadata(
 
     for update in updates:
         new_metadata = _apply_table_update(update, new_metadata, context)
+
+    # Update last_updated_ms if it was not updated by update operations
+    if context.has_changes() and base_metadata.last_updated_ms == new_metadata.last_updated_ms:
+        new_metadata = new_metadata.model_copy(update={"last_updated_ms": datetime_to_millis(datetime.now().astimezone())})
 
     if enforce_validation:
         return TableMetadataUtil.parse_obj(new_metadata.model_dump())
@@ -1888,7 +1859,7 @@ def _open_manifest(
     ]
 
 
-def _min_data_file_sequence_number(manifests: List[ManifestFile]) -> int:
+def _min_sequence_number(manifests: List[ManifestFile]) -> int:
     try:
         return min(
             manifest.min_sequence_number or INITIAL_SEQUENCE_NUMBER
@@ -1949,11 +1920,11 @@ class DataScan(TableScan):
         # shared instance across multiple threads.
         return lambda data_file: expression_evaluator(partition_schema, partition_expr, self.case_sensitive)(data_file.partition)
 
-    def _check_sequence_number(self, min_data_sequence_number: int, manifest: ManifestFile) -> bool:
+    def _check_sequence_number(self, min_sequence_number: int, manifest: ManifestFile) -> bool:
         """Ensure that no manifests are loaded that contain deletes that are older than the data.
 
         Args:
-            min_data_sequence_number (int): The minimal sequence number.
+            min_sequence_number (int): The minimal sequence number.
             manifest (ManifestFile): A ManifestFile that can be either data or deletes.
 
         Returns:
@@ -1962,7 +1933,7 @@ class DataScan(TableScan):
         return manifest.content == ManifestContent.DATA or (
             # Not interested in deletes that are older than the data
             manifest.content == ManifestContent.DELETES
-            and (manifest.sequence_number or INITIAL_SEQUENCE_NUMBER) >= min_data_sequence_number
+            and (manifest.sequence_number or INITIAL_SEQUENCE_NUMBER) >= min_sequence_number
         )
 
     def plan_files(self) -> Iterable[FileScanTask]:
@@ -1994,10 +1965,10 @@ class DataScan(TableScan):
             self.table_metadata.schema(), self.row_filter, self.case_sensitive, self.options.get("include_empty_files") == "true"
         ).eval
 
-        min_data_sequence_number = _min_data_file_sequence_number(manifests)
+        min_sequence_number = _min_sequence_number(manifests)
 
         data_entries: List[ManifestEntry] = []
-        positional_delete_entries = SortedList(key=lambda entry: entry.data_sequence_number or INITIAL_SEQUENCE_NUMBER)
+        positional_delete_entries = SortedList(key=lambda entry: entry.sequence_number or INITIAL_SEQUENCE_NUMBER)
 
         executor = ExecutorFactory.get_or_create()
         for manifest_entry in chain(
@@ -2011,7 +1982,7 @@ class DataScan(TableScan):
                         metrics_evaluator,
                     )
                     for manifest in manifests
-                    if self._check_sequence_number(min_data_sequence_number, manifest)
+                    if self._check_sequence_number(min_sequence_number, manifest)
                 ],
             )
         ):
@@ -2054,8 +2025,9 @@ class DataScan(TableScan):
 
         from pyiceberg.io.pyarrow import project_batches, schema_to_pyarrow
 
+        target_schema = schema_to_pyarrow(self.projection())
         return pa.RecordBatchReader.from_batches(
-            schema_to_pyarrow(self.projection()),
+            target_schema,
             project_batches(
                 self.plan_files(),
                 self.table_metadata,
@@ -3150,7 +3122,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
                             ManifestEntry(
                                 status=ManifestEntryStatus.ADDED,
                                 snapshot_id=self._snapshot_id,
-                                data_sequence_number=None,
+                                sequence_number=None,
                                 file_sequence_number=None,
                                 data_file=data_file,
                             )
@@ -3353,7 +3325,7 @@ class DeleteFiles(_SnapshotProducer["DeleteFiles"]):
             return ManifestEntry(
                 status=status,
                 snapshot_id=entry.snapshot_id,
-                data_sequence_number=entry.data_sequence_number,
+                sequence_number=entry.sequence_number,
                 file_sequence_number=entry.file_sequence_number,
                 data_file=entry.data_file,
             )
@@ -3537,7 +3509,7 @@ class OverwriteFiles(_SnapshotProducer["OverwriteFiles"]):
                                     ManifestEntry(
                                         status=ManifestEntryStatus.EXISTING,
                                         snapshot_id=entry.snapshot_id,
-                                        data_sequence_number=entry.data_sequence_number,
+                                        sequence_number=entry.sequence_number,
                                         file_sequence_number=entry.file_sequence_number,
                                         data_file=entry.data_file,
                                     )
@@ -3568,7 +3540,7 @@ class OverwriteFiles(_SnapshotProducer["OverwriteFiles"]):
                     ManifestEntry(
                         status=ManifestEntryStatus.DELETED,
                         snapshot_id=entry.snapshot_id,
-                        data_sequence_number=entry.data_sequence_number,
+                        sequence_number=entry.sequence_number,
                         file_sequence_number=entry.file_sequence_number,
                         data_file=entry.data_file,
                     )
@@ -4016,7 +3988,7 @@ class InspectTable:
                 entries.append({
                     "status": entry.status.value,
                     "snapshot_id": entry.snapshot_id,
-                    "sequence_number": entry.data_sequence_number,
+                    "sequence_number": entry.sequence_number,
                     "file_sequence_number": entry.file_sequence_number,
                     "data_file": {
                         "content": entry.data_file.content,
@@ -4410,105 +4382,6 @@ class InspectTable:
             files,
             schema=files_schema,
         )
-
-
-@dataclass(frozen=True)
-class TablePartition:
-    partition_key: PartitionKey
-    arrow_table_partition: pa.Table
-
-
-def _get_table_partitions(
-    arrow_table: pa.Table,
-    partition_spec: PartitionSpec,
-    schema: Schema,
-    slice_instructions: list[dict[str, Any]],
-) -> list[TablePartition]:
-    sorted_slice_instructions = sorted(slice_instructions, key=lambda x: x["offset"])
-
-    partition_fields = partition_spec.fields
-
-    offsets = [inst["offset"] for inst in sorted_slice_instructions]
-    projected_and_filtered = {
-        partition_field.source_id: arrow_table[schema.find_field(name_or_id=partition_field.source_id).name]
-        .take(offsets)
-        .to_pylist()
-        for partition_field in partition_fields
-    }
-
-    table_partitions = []
-    for idx, inst in enumerate(sorted_slice_instructions):
-        partition_slice = arrow_table.slice(**inst)
-        fieldvalues = [
-            PartitionFieldValue(partition_field, projected_and_filtered[partition_field.source_id][idx])
-            for partition_field in partition_fields
-        ]
-        partition_key = PartitionKey(raw_partition_field_values=fieldvalues, partition_spec=partition_spec, schema=schema)
-        table_partitions.append(TablePartition(partition_key=partition_key, arrow_table_partition=partition_slice))
-    return table_partitions
-
-
-def _determine_partitions(spec: PartitionSpec, schema: Schema, arrow_table: pa.Table) -> List[TablePartition]:
-    """Based on the iceberg table partition spec, slice the arrow table into partitions with their keys.
-
-    Example:
-    Input:
-    An arrow table with partition key of ['n_legs', 'year'] and with data of
-    {'year': [2020, 2022, 2022, 2021, 2022, 2022, 2022, 2019, 2021],
-     'n_legs': [2, 2, 2, 4, 4, 4, 4, 5, 100],
-     'animal': ["Flamingo", "Parrot", "Parrot", "Dog", "Horse", "Horse", "Horse","Brittle stars", "Centipede"]}.
-    The algorithm:
-    Firstly we group the rows into partitions by sorting with sort order [('n_legs', 'descending'), ('year', 'descending')]
-    and null_placement of "at_end".
-    This gives the same table as raw input.
-    Then we sort_indices using reverse order of [('n_legs', 'descending'), ('year', 'descending')]
-    and null_placement : "at_start".
-    This gives:
-    [8, 7, 4, 5, 6, 3, 1, 2, 0]
-    Based on this we get partition groups of indices:
-    [{'offset': 8, 'length': 1}, {'offset': 7, 'length': 1}, {'offset': 4, 'length': 3}, {'offset': 3, 'length': 1}, {'offset': 1, 'length': 2}, {'offset': 0, 'length': 1}]
-    We then retrieve the partition keys by offsets.
-    And slice the arrow table by offsets and lengths of each partition.
-    """
-    import pyarrow as pa
-
-    partition_columns: List[Tuple[PartitionField, NestedField]] = [
-        (partition_field, schema.find_field(partition_field.source_id)) for partition_field in spec.fields
-    ]
-    partition_values_table = pa.table({
-        str(partition.field_id): partition.transform.pyarrow_transform(field.field_type)(arrow_table[field.name])
-        for partition, field in partition_columns
-    })
-
-    # Sort by partitions
-    sort_indices = pa.compute.sort_indices(
-        partition_values_table,
-        sort_keys=[(col, "ascending") for col in partition_values_table.column_names],
-        null_placement="at_end",
-    ).to_pylist()
-    arrow_table = arrow_table.take(sort_indices)
-
-    # Get slice_instructions to group by partitions
-    partition_values_table = partition_values_table.take(sort_indices)
-    reversed_indices = pa.compute.sort_indices(
-        partition_values_table,
-        sort_keys=[(col, "descending") for col in partition_values_table.column_names],
-        null_placement="at_start",
-    ).to_pylist()
-    slice_instructions: List[Dict[str, Any]] = []
-    last = len(reversed_indices)
-    reversed_indices_size = len(reversed_indices)
-    ptr = 0
-    while ptr < reversed_indices_size:
-        group_size = last - reversed_indices[ptr]
-        offset = reversed_indices[ptr]
-        slice_instructions.append({"offset": offset, "length": group_size})
-        last = reversed_indices[ptr]
-        ptr = ptr + group_size
-
-    table_partitions: List[TablePartition] = _get_table_partitions(arrow_table, spec, schema, slice_instructions)
-
-    return table_partitions
 
 
 class _ManifestMergeManager(Generic[U]):
